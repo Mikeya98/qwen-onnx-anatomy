@@ -1,0 +1,8 @@
+# 模型权重，太大不上传
+qwen2.5-1.5b-instruct-onnx-fp16/
+*.onnx_data
+*.onnx
+
+# Python
+__pycache__/
+*.pyc
