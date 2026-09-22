@@ -1,28 +1,24 @@
 # qwen-onnx-anatomy
 
-把 Qwen2.5-1.5B-Instruct 的 ONNX 模型拆开看了一遍：图结构、参数量账目、KV cache 签名。起因是想搞清楚"一个 15 亿参数的大模型，在硬盘上到底长什么样"，而不是停在 `model.generate()` 一行的黑盒。
+把 Qwen2.5-1.5B-Instruct 的 ONNX 模型拆开、跑起来、量化的全过程。起因是想搞清楚"一个 15 亿参数的大模型，在硬盘上到底长什么样、纯 CPU 上到底能不能跑"，而不是停在 `model.generate()` 一行的黑盒。
 
-配套文章：[拆开 Qwen2.5-1.5B 的 ONNX 文件：一个 15 亿参数的模型长什么样](https://zhuanlan.zhihu.com/p/2085479762013729545)。
+配套文章：
 
-## 这脚本干什么
+- [拆开 Qwen2.5-1.5B 的 ONNX 文件：一个 15 亿参数的模型长什么样](https://zhuanlan.zhihu.com/p/2085479762013729545)
+- 把 Qwen2.5-1.5B 在纯 CPU 上跑起来（本篇，含 fp16/fp32/int8 实测耗时 + 量化踩坑）
 
-大模型的 ONNX 文件本质是一个 protobuf 序列化的计算图，图里既装算子节点，也装权重。这个脚本把图读出来，回答几个问题：
+## 四个脚本
 
-- `model_fp16.onnx` 和 `model_fp16.onnx_data` 两个文件分别装了什么，为什么一个 1.1MB 一个 3.1GB
-- 3207 个节点都在算什么，算子有哪些
-- "15 亿参数"这 15 亿摊在哪：词嵌入、注意力、FFN、归一化各占多少
-- 为什么输入 59 个、输出 57 个，KV cache 长什么样
+| 脚本 | 干什么 | 依赖 |
+|---|---|---|
+| `analyze_qwen_onnx.py` | 拆图：算子统计 / 参数量对账 / KV cache 签名，不加载权重 | `onnx` |
+| `run_qwen_cpu.py` | 纯 CPU 跑通生成循环 + 测单 token 耗时 | `onnxruntime` + `tokenizers` |
+| `to_fp32.py` | 把全 fp16 模型转成 fp32 | `onnx` |
+| `quantize_qwen.py` | 对 fp32 模型做 int8 动态量化 | `onnxruntime` |
 
 ## 怎么跑
 
-只依赖 `onnx`，而且不加载权重（`load_external_data=False`），几秒出结果：
-
-```bash
-pip install onnx
-python analyze_qwen_onnx.py <模型目录>
-```
-
-`<模型目录>` 是下载下来的那个文件夹，里面要有 `onnx/model_fp16.onnx`。模型从 onnx-community 拿（只跑这个脚本的话，下 onnx 两个文件就够；要真正跑推理还得带上 config.json、tokenizer.json 那些）：
+先下模型（走 hf-mirror 镜像，直连下不动）：
 
 ```python
 from huggingface_hub import snapshot_download
@@ -31,34 +27,43 @@ os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 
 snapshot_download(
     "onnx-community/Qwen2.5-1.5B-Instruct",
-    allow_patterns=["onnx/model_fp16.onnx", "onnx/model_fp16.onnx_data"],
     local_dir="qwen2.5-1.5b-instruct-onnx-fp16",
 )
 ```
 
-不传参数的话，脚本会在自己所在目录下找 `qwen2.5-1.5b-instruct-onnx-fp16` 这个文件夹。
+**拆图**（只依赖 onnx，不加载权重，几秒出结果）：
 
-## 跑出来是什么
-
-关键几行：
-
-```
-float16 权重 : 569 个，共 1,552,103,141 参数
-图结构       : 1.10 MB
-权重         : 3.10 GB
-
-手算合计            : 1,552,102,912
-文件里实际 float16  : 1,552,103,141
-差值                : 229
+```bash
+pip install onnx
+python analyze_qwen_onnx.py qwen2.5-1.5b-instruct-onnx-fp16
 ```
 
-手算和文件里实际存的只差 229 个参数，是几个零散的常量。能对上，说明"15 亿参数"不是厂家拍脑袋报的数，自己一步步能算出来。
+**纯 CPU 跑通 + 测耗时**（线程数可加第三个参数）：
 
-## 几个有意思的点
+```bash
+pip install onnxruntime tokenizers
+python run_qwen_cpu.py qwen2.5-1.5b-instruct-onnx-fp16 30 16
+```
 
-- FFN 占了大头：11.6 亿 / 15.5 亿（约 75%），参数主要堆在 feed-forward，不在注意力
-- GQA 省参数：12 个 query 头只有 2 个 KV 头，K/V 投影从 1536×1536 缩到 1536×256
-- 权重是 fp16，但 KV cache 和 logits 是 fp32，别被文件名里的 "fp16" 骗了
-- RoPE 的 cos/sin 表被展开存了 840 万参数，比所有归一化权重加起来还大两个数量级
+**量化**（一定要先转 fp32，直接量化 fp16 会报类型错误）：
+
+```bash
+python to_fp32.py qwen2.5-1.5b-instruct-onnx-fp16/onnx/model_fp16.onnx model_fp32.onnx
+python quantize_qwen.py model_fp32.onnx int8/model_int8.onnx
+```
+
+## 实测结果（16 核纯 CPU）
+
+| 版本 | 权重文件 | prefill（24 token） | decode 单 token |
+|---|---|---|---|
+| fp16（原始） | 3.10GB | 2.87s | 1561ms |
+| fp32（转的） | 6.20GB | 0.43s | 347ms |
+| int8（量化的） | 1.56GB | 0.52s | 281ms |
+
+几个有意思的点：
+
+- **fp16 在纯 CPU 上反而最慢**。CPU 没有 fp16 算数单元，图里 115 个 Cast 全是来回转换的开销。fp16 是给 GPU 的。
+- **decode 不随线程数变**（内存带宽受限），prefill 随线程数变（计算密集）。加核心救不了 decode。
+- **int8 砍半体积、提 5 倍速度，但小模型动态量化会崩精度**。让 int8 模型回答"1+1 等于几"直接答非所问。要保精度得静态量化 + 校准集。
 
 详细拆解在文章里。
